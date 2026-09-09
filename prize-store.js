@@ -50,8 +50,25 @@ async function initDatabase() {
       status          TEXT        NOT NULL DEFAULT 'pending',
       created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      error_message   TEXT
+      error_message   TEXT,
+      claim_type      TEXT,
+      scheduled_for   TIMESTAMPTZ,
+      nft_slug        TEXT
     );
+  `;
+
+  // Additive columns for installs that already have the old `prizes`
+  // table from V1 — CREATE TABLE IF NOT EXISTS above won't add columns
+  // to an existing table, so cover that path explicitly.
+  const addColumns = `
+    ALTER TABLE prizes ADD COLUMN IF NOT EXISTS claim_type    TEXT;
+    ALTER TABLE prizes ADD COLUMN IF NOT EXISTS scheduled_for TIMESTAMPTZ;
+    ALTER TABLE prizes ADD COLUMN IF NOT EXISTS nft_slug      TEXT;
+    ALTER TABLE users  ADD COLUMN IF NOT EXISTS last_claim_at TIMESTAMPTZ;
+  `;
+
+  const createIndexScheduled = `
+    CREATE INDEX IF NOT EXISTS idx_prizes_scheduled ON prizes (status, scheduled_for);
   `;
 
   const createIndexUser = `
@@ -89,8 +106,10 @@ async function initDatabase() {
   `;
 
   await pool.query(createTable);
+  await pool.query(addColumns);
   await pool.query(createIndexUser);
   await pool.query(createIndexStatus);
+  await pool.query(createIndexScheduled);
   await pool.query(createUsersTable);
   await pool.query(createIndexCoins);
   await pool.query(createIndexStars);
@@ -247,7 +266,7 @@ app.patch('/prizes/:prize_id', async (req, res) => {
     return res.status(400).json({ error: 'status is required' });
   }
 
-  const allowed = ['pending', 'claiming', 'claimed', 'failed'];
+  const allowed = ['pending', 'claiming', 'queued_nft', 'claimed', 'failed'];
   if (!allowed.includes(status)) {
     return res.status(400).json({
       error: `Invalid status. Must be one of: ${allowed.join(', ')}`
@@ -274,6 +293,171 @@ app.patch('/prizes/:prize_id', async (req, res) => {
 
   } catch (err) {
     console.error('❌ PATCH /prizes/:id error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================
+// POST /prizes/:prize_id/lock
+// ============================================
+// Called by: gift-relayer, as the FIRST step of a claim.
+// Atomically flips pending -> claiming. This is the thing that makes
+// concurrent/duplicate claim requests for the same prize safe: only
+// one request can ever win the WHERE status='pending' race, everyone
+// else gets 409 and bails before touching the relayer's balance.
+// Body: { user_id }  — must match the prize's owner.
+// ============================================
+
+app.post('/prizes/:prize_id/lock', async (req, res) => {
+  const { prize_id } = req.params;
+  const { user_id } = req.body;
+
+  if (!user_id) return res.status(400).json({ error: 'user_id is required' });
+
+  try {
+    const result = await pool.query(
+      `UPDATE prizes
+       SET status = 'claiming', updated_at = NOW()
+       WHERE prize_id = $1 AND user_id = $2 AND status = 'pending'
+       RETURNING *`,
+      [prize_id, user_id]
+    );
+
+    if (result.rows.length === 0) {
+      // Distinguish "doesn't exist / wrong owner" from "already being
+      // claimed or already claimed" so the relayer can give a sane error.
+      const existing = await pool.query('SELECT status, user_id FROM prizes WHERE prize_id = $1', [prize_id]);
+      if (existing.rows.length === 0) {
+        return res.status(404).json({ error: 'Prize not found' });
+      }
+      if (String(existing.rows[0].user_id) !== String(user_id)) {
+        return res.status(403).json({ error: 'Prize does not belong to this user' });
+      }
+      return res.status(409).json({ error: `Prize is not claimable (status: ${existing.rows[0].status})` });
+    }
+
+    console.log(`🔒 Prize locked for claim: ${prize_id}`);
+    res.json({ success: true, prize: result.rows[0] });
+
+  } catch (err) {
+    console.error('❌ POST /prizes/:id/lock error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================
+// POST /prizes/:prize_id/schedule
+// ============================================
+// Called by: gift-relayer, right after locking, when the gift is an
+// NFT/collectible that needs the 48h transfer window instead of an
+// immediate send. Must already be in 'claiming' status.
+// Body: { claim_type: 'nft', scheduled_for (ISO string), nft_slug? }
+// ============================================
+
+app.post('/prizes/:prize_id/schedule', async (req, res) => {
+  const { prize_id } = req.params;
+  const { claim_type, scheduled_for, nft_slug } = req.body;
+
+  if (!claim_type || !scheduled_for) {
+    return res.status(400).json({ error: 'claim_type and scheduled_for are required' });
+  }
+
+  try {
+    const result = await pool.query(
+      `UPDATE prizes
+       SET status = 'queued_nft', claim_type = $1, scheduled_for = $2, nft_slug = $3, updated_at = NOW()
+       WHERE prize_id = $4 AND status = 'claiming'
+       RETURNING *`,
+      [claim_type, scheduled_for, nft_slug || null, prize_id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(409).json({ error: 'Prize must be in "claiming" status to schedule' });
+    }
+
+    console.log(`⏳ Prize ${prize_id} scheduled for ${scheduled_for}`);
+    res.json({ success: true, prize: result.rows[0] });
+
+  } catch (err) {
+    console.error('❌ POST /prizes/:id/schedule error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================
+// GET /prizes/queue/nft-due
+// ============================================
+// Called by: gift-relayer's background worker, polling for NFT
+// transfers whose 48h window has elapsed.
+// ============================================
+
+app.get('/prizes/queue/nft-due', async (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit, 10) || 20, 100);
+
+  try {
+    const result = await pool.query(
+      `SELECT * FROM prizes
+       WHERE status = 'queued_nft' AND scheduled_for <= NOW()
+       ORDER BY scheduled_for ASC
+       LIMIT $1`,
+      [limit]
+    );
+    res.json(result.rows);
+
+  } catch (err) {
+    console.error('❌ GET /prizes/queue/nft-due error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================
+// POST /users/:user_id/cooldown
+// ============================================
+// Called by: gift-relayer, before doing anything else for a claim
+// request. Atomically checks-and-sets last_claim_at so the cooldown
+// is enforced even across relayer restarts/multiple instances —
+// the DB row is the single source of truth, not in-memory state.
+// Body: { cooldown_seconds }
+// Returns 200 { ok: true } if the claim may proceed (and marks the
+// cooldown as started), or 429 { ok: false, retry_after } if not.
+// ============================================
+
+app.post('/users/:user_id/cooldown', async (req, res) => {
+  const { user_id } = req.params;
+  const cooldownSeconds = parseInt(req.body.cooldown_seconds, 10) || 10;
+
+  if (!user_id || isNaN(Number(user_id))) {
+    return res.status(400).json({ error: 'Valid numeric user_id is required' });
+  }
+
+  try {
+    // Upsert first so first-time claimers have a row to race against.
+    await pool.query(
+      `INSERT INTO users (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING`,
+      [user_id]
+    );
+
+    const result = await pool.query(
+      `UPDATE users
+       SET last_claim_at = NOW()
+       WHERE user_id = $1
+         AND (last_claim_at IS NULL OR last_claim_at <= NOW() - ($2 || ' seconds')::interval)
+       RETURNING last_claim_at`,
+      [user_id, cooldownSeconds]
+    );
+
+    if (result.rows.length > 0) {
+      return res.json({ ok: true });
+    }
+
+    const current = await pool.query('SELECT last_claim_at FROM users WHERE user_id = $1', [user_id]);
+    const lastClaim = current.rows[0]?.last_claim_at ? new Date(current.rows[0].last_claim_at) : new Date();
+    const retryAfter = Math.max(0, cooldownSeconds - Math.floor((Date.now() - lastClaim.getTime()) / 1000));
+
+    res.status(429).json({ ok: false, retry_after: retryAfter });
+
+  } catch (err) {
+    console.error('❌ POST /users/:id/cooldown error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -491,13 +675,17 @@ async function start() {
     console.log('✅ CORS enabled for all origins');
     console.log('');
     console.log('📡 Endpoints:');
-    console.log('   POST   /prizes          → store a new prize');
-    console.log('   GET    /prizes?user_id= → get user prizes');
-    console.log('   GET    /prizes/:id      → get one prize');
-    console.log('   PATCH  /prizes/:id      → update status');
-    console.log('   DELETE /prizes/:id      → remove claimed prize');
-    console.log('   PUT    /users/:id       → upsert profile/balances');
-    console.log('   GET    /leaderboard     → top coins/stars/gifts + your rank');
+    console.log('   POST   /prizes               → store a new prize');
+    console.log('   GET    /prizes?user_id=      → get user prizes');
+    console.log('   GET    /prizes/:id           → get one prize');
+    console.log('   PATCH  /prizes/:id           → update status');
+    console.log('   POST   /prizes/:id/lock      → atomically lock for claim (V2)');
+    console.log('   POST   /prizes/:id/schedule  → schedule NFT transfer (V2)');
+    console.log('   GET    /prizes/queue/nft-due → due NFT transfers (V2)');
+    console.log('   POST   /users/:id/cooldown   → atomic claim-cooldown check (V2)');
+    console.log('   DELETE /prizes/:id           → remove claimed prize');
+    console.log('   PUT    /users/:id            → upsert profile/balances');
+    console.log('   GET    /leaderboard          → top coins/stars/gifts + your rank');
     console.log('═══════════════════════════════════════════');
   });
 }
