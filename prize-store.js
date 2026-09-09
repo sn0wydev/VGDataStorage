@@ -433,6 +433,52 @@ app.get('/prizes/queue/nft-due', async (req, res) => {
 });
 
 // ============================================
+// DELETE /users/:user_id/cooldown
+// ============================================
+// Called by: gift-relayer, when a claim fails AFTER the cooldown was
+// already started for it (see POST /users/:id/cooldown below). Without
+// this, a failed claim still leaves last_claim_at set, so the user's
+// very next (genuine) retry gets rejected with 429 "Please slow down"
+// even though nothing of theirs was ever actually claimed.
+//
+// Only rolls the timestamp back if it matches what the relayer itself
+// just set (passed back as expected_last_claim_at) — this stops a
+// slow/late release call from accidentally wiping out a NEWER cooldown
+// started by a different, unrelated claim attempt in the meantime.
+// Body: { expected_last_claim_at }
+// ============================================
+
+app.delete('/users/:user_id/cooldown', async (req, res) => {
+  const { user_id } = req.params;
+  const { expected_last_claim_at } = req.body;
+
+  if (!user_id || isNaN(Number(user_id))) {
+    return res.status(400).json({ error: 'Valid numeric user_id is required' });
+  }
+  if (!expected_last_claim_at) {
+    return res.status(400).json({ error: 'expected_last_claim_at is required' });
+  }
+
+  try {
+    const result = await pool.query(
+      `UPDATE users
+       SET last_claim_at = NULL
+       WHERE user_id = $1 AND last_claim_at = $2
+       RETURNING user_id`,
+      [user_id, expected_last_claim_at]
+    );
+
+    // No match just means someone else's claim already moved the
+    // timestamp forward — nothing to release, and nothing to undo.
+    res.json({ ok: true, released: result.rows.length > 0 });
+
+  } catch (err) {
+    console.error('❌ DELETE /users/:id/cooldown error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================
 // POST /users/:user_id/cooldown
 // ============================================
 // Called by: gift-relayer, before doing anything else for a claim
@@ -478,7 +524,7 @@ app.post('/users/:user_id/cooldown', async (req, res) => {
     );
 
     if (result.rows.length > 0) {
-      return res.json({ ok: true });
+      return res.json({ ok: true, last_claim_at: result.rows[0].last_claim_at });
     }
 
     const current = await pool.query('SELECT last_claim_at FROM users WHERE user_id = $1', [user_id]);
@@ -714,6 +760,7 @@ async function start() {
     console.log('   POST   /prizes/:id/schedule  → schedule NFT transfer (V2)');
     console.log('   GET    /prizes/queue/nft-due → due NFT transfers (V2)');
     console.log('   POST   /users/:id/cooldown   → atomic claim-cooldown check (V2)');
+    console.log('   DELETE /users/:id/cooldown   → release cooldown after a failed claim (V2)');
     console.log('   DELETE /prizes/:id           → remove claimed prize');
     console.log('   PUT    /users/:id            → upsert profile/balances');
     console.log('   GET    /leaderboard          → top coins/stars/gifts + your rank');
