@@ -266,7 +266,7 @@ app.patch('/prizes/:prize_id', async (req, res) => {
     return res.status(400).json({ error: 'status is required' });
   }
 
-  const allowed = ['pending', 'claiming', 'queued_nft', 'claimed', 'failed'];
+  const allowed = ['pending', 'claiming', 'queued_nft', 'claimed', 'failed', 'converted'];
   if (!allowed.includes(status)) {
     return res.status(400).json({
       error: `Invalid status. Must be one of: ${allowed.join(', ')}`
