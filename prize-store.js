@@ -5,10 +5,20 @@
 // Link your PostgreSQL addon to it —
 // the DATABASE_URL variable will be set
 // automatically via ${{ Postgres.DATABASE_URL }}
+//
+// ── FIXES APPLIED (see inline "FIX:" comments) ──
+//   1. /users/:id/cooldown treated cooldown_seconds=0 as "not provided"
+//      because of `parseInt(...) || 10`, silently forcing a 10s cooldown
+//      even when the caller explicitly asked for 0.
+//   2. initDatabase() ran `ALTER TABLE users ADD COLUMN ...` before the
+//      `users` table itself was created, which throws on a totally fresh
+//      database (no prior `users` table) and crashes startup. Reordered
+//      so `users` is created first, and `last_claim_at` is now part of
+//      that CREATE TABLE directly instead of depending on the ALTER.
 // ============================================
 
 const express = require('express');
-const cors = require('cors'); // ← ADDED: CORS module
+const cors = require('cors'); // ← CORS module
 const { Pool } = require('pg');
 
 const app = express();
@@ -57,9 +67,38 @@ async function initDatabase() {
     );
   `;
 
+  // ── Leaderboard support ──
+  // Coins/Stars used to live only in Telegram CloudStorage (per-device),
+  // so there was nothing server-side to rank. This table is the shared
+  // source of truth the webapp pushes to on every balance change.
+  //
+  // FIX: last_claim_at now lives directly in this CREATE TABLE (it used
+  // to only be added via the ALTER TABLE below, which ran BEFORE this
+  // table existed on a fresh install and crashed initDatabase()).
+  const createUsersTable = `
+    CREATE TABLE IF NOT EXISTS users (
+      user_id              BIGINT      PRIMARY KEY,
+      username              TEXT,
+      first_name            TEXT,
+      last_name             TEXT,
+      avatar_url             TEXT,
+      coins                 BIGINT      NOT NULL DEFAULT 0,
+      stars                  BIGINT      NOT NULL DEFAULT 0,
+      show_in_leaderboard    BOOLEAN     NOT NULL DEFAULT true,
+      last_claim_at          TIMESTAMPTZ,
+      updated_at             TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `;
+
   // Additive columns for installs that already have the old `prizes`
-  // table from V1 — CREATE TABLE IF NOT EXISTS above won't add columns
-  // to an existing table, so cover that path explicitly.
+  // / `users` tables from before this migration existed — CREATE TABLE
+  // IF NOT EXISTS above won't add columns to an already-existing table,
+  // so cover that path explicitly. Safe to run every boot: IF NOT EXISTS
+  // makes every one of these a no-op once the column is already there.
+  //
+  // FIX: this now runs AFTER both createTable and createUsersTable, so
+  // `ALTER TABLE users ...` always has a `users` table to alter, even on
+  // a completely fresh database.
   const addColumns = `
     ALTER TABLE prizes ADD COLUMN IF NOT EXISTS claim_type    TEXT;
     ALTER TABLE prizes ADD COLUMN IF NOT EXISTS scheduled_for TIMESTAMPTZ;
@@ -79,24 +118,6 @@ async function initDatabase() {
     CREATE INDEX IF NOT EXISTS idx_prizes_status ON prizes (status);
   `;
 
-  // ── Leaderboard support ──
-  // Coins/Stars used to live only in Telegram CloudStorage (per-device),
-  // so there was nothing server-side to rank. This table is the shared
-  // source of truth the webapp pushes to on every balance change.
-  const createUsersTable = `
-    CREATE TABLE IF NOT EXISTS users (
-      user_id              BIGINT      PRIMARY KEY,
-      username              TEXT,
-      first_name            TEXT,
-      last_name             TEXT,
-      avatar_url             TEXT,
-      coins                 BIGINT      NOT NULL DEFAULT 0,
-      stars                  BIGINT      NOT NULL DEFAULT 0,
-      show_in_leaderboard    BOOLEAN     NOT NULL DEFAULT true,
-      updated_at             TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-  `;
-
   const createIndexCoins = `
     CREATE INDEX IF NOT EXISTS idx_users_coins ON users (coins DESC);
   `;
@@ -105,12 +126,13 @@ async function initDatabase() {
     CREATE INDEX IF NOT EXISTS idx_users_stars ON users (stars DESC);
   `;
 
+  // FIX: order changed — both tables exist before addColumns touches either.
   await pool.query(createTable);
+  await pool.query(createUsersTable);
   await pool.query(addColumns);
   await pool.query(createIndexUser);
   await pool.query(createIndexStatus);
   await pool.query(createIndexScheduled);
-  await pool.query(createUsersTable);
   await pool.query(createIndexCoins);
   await pool.query(createIndexStars);
 
@@ -168,18 +190,18 @@ app.post('/prizes', async (req, res) => {
 
     if (result.rows.length > 0) {
       console.log(`✅ Prize stored successfully!`);
-      res.status(201).json({ 
-        success: true, 
+      res.status(201).json({
+        success: true,
         prize_id,
         message: 'Prize registered successfully',
         prize: result.rows[0]
       });
     } else {
       console.log('⚠️ Prize already exists (duplicate)');
-      res.status(200).json({ 
-        success: true, 
+      res.status(200).json({
+        success: true,
         prize_id,
-        message: 'Prize already registered' 
+        message: 'Prize already registered'
       });
     }
 
@@ -424,7 +446,16 @@ app.get('/prizes/queue/nft-due', async (req, res) => {
 
 app.post('/users/:user_id/cooldown', async (req, res) => {
   const { user_id } = req.params;
-  const cooldownSeconds = parseInt(req.body.cooldown_seconds, 10) || 10;
+
+  // FIX: `parseInt(req.body.cooldown_seconds, 10) || 10` treated an
+  // explicit 0 the same as "not provided", because 0 is falsy in JS —
+  // so cooldown_seconds: 0 silently became a 10s cooldown no matter
+  // what the caller asked for. Only fall back to the 10s default when
+  // the value is genuinely missing/invalid (not a finite number >= 0).
+  let cooldownSeconds = parseInt(req.body.cooldown_seconds, 10);
+  if (!Number.isFinite(cooldownSeconds) || cooldownSeconds < 0) {
+    cooldownSeconds = 10;
+  }
 
   if (!user_id || isNaN(Number(user_id))) {
     return res.status(400).json({ error: 'Valid numeric user_id is required' });
