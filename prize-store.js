@@ -47,6 +47,34 @@ pool.on('error', (err) => {
 });
 
 // ============================================
+// SUBSCRIPTION CHECK CACHE
+// ============================================
+// GET /check-subscription hits Telegram's getChatMember for every
+// call. That's fine for a one-off click, but the frontend also calls
+// it right before every spin attempt, so a short in-memory cache keeps
+// a user mashing "Check Again" (or re-opening Void Spin repeatedly)
+// from hammering the Bot API and tripping its rate limit. Positive AND
+// negative results are cached — negative ones expire faster so someone
+// who just joined isn't stuck waiting out the full TTL.
+// ============================================
+
+const subCache = new Map(); // `${userId}:${channel}` -> { subscribed, expiresAt }
+const SUB_CACHE_TTL_SUBSCRIBED_MS = 60_000;
+const SUB_CACHE_TTL_UNSUBSCRIBED_MS = 15_000;
+
+function getCachedSub(key) {
+  const hit = subCache.get(key);
+  if (!hit) return undefined;
+  if (Date.now() > hit.expiresAt) { subCache.delete(key); return undefined; }
+  return hit.subscribed;
+}
+
+function setCachedSub(key, subscribed) {
+  const ttl = subscribed ? SUB_CACHE_TTL_SUBSCRIBED_MS : SUB_CACHE_TTL_UNSUBSCRIBED_MS;
+  subCache.set(key, { subscribed, expiresAt: Date.now() + ttl });
+}
+
+// ============================================
 // AUTO-CREATE TABLE ON STARTUP
 // ============================================
 
