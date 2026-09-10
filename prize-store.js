@@ -337,10 +337,19 @@ app.post('/prizes/:prize_id/lock', async (req, res) => {
   if (!user_id) return res.status(400).json({ error: 'user_id is required' });
 
   try {
+    // FIX: a claim that fails downstream (e.g. a bad send to Telegram)
+    // gets PATCHed to status='failed' by the relayer, but nothing ever
+    // moved it back to 'pending'. Since this lock only matched
+    // status='pending', the very first real failure permanently
+    // stranded that prize — every retry got 409 "not claimable" forever,
+    // even though the user never actually received anything. 'failed'
+    // is now accepted here too, so a failed claim can be retried; only
+    // 'claiming' (in-flight) and 'claimed'/'queued_nft' (already
+    // succeeded) still correctly block re-locking.
     const result = await pool.query(
       `UPDATE prizes
        SET status = 'claiming', updated_at = NOW()
-       WHERE prize_id = $1 AND user_id = $2 AND status = 'pending'
+       WHERE prize_id = $1 AND user_id = $2 AND status IN ('pending', 'failed')
        RETURNING *`,
       [prize_id, user_id]
     );
