@@ -514,9 +514,19 @@ app.post('/users/:user_id/cooldown', async (req, res) => {
       [user_id]
     );
 
+    // FIX: truncate to millisecond precision on write. TIMESTAMPTZ stores
+    // microseconds, but the value we hand back gets JSON-round-tripped
+    // through a JS Date (ms precision only) before the relayer sends it
+    // back to DELETE /cooldown for release. Without this truncation the
+    // stored (microsecond) value never equals the round-tripped (ms)
+    // value, so `last_claim_at = $2` in the release query never matches,
+    // the release silently no-ops, and every failed claim leaves the
+    // cooldown stuck for its full duration — bouncing the user's next
+    // genuine retry with 429 "Please slow down" even though nothing of
+    // theirs actually succeeded.
     const result = await pool.query(
       `UPDATE users
-       SET last_claim_at = NOW()
+       SET last_claim_at = date_trunc('milliseconds', NOW())
        WHERE user_id = $1
          AND (last_claim_at IS NULL OR last_claim_at <= NOW() - ($2 || ' seconds')::interval)
        RETURNING last_claim_at`,
