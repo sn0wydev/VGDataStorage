@@ -46,42 +46,6 @@ pool.on('error', (err) => {
   console.error('❌ PostgreSQL pool error:', err.message);
 });
 
-// Needed for GET /check-subscription below (Telegram getChatMember calls).
-// Set this in Railway's service variables. The bot must be an admin of
-// the channel being checked, or getChatMember will fail for that channel.
-const BOT_TOKEN = process.env.BOT_TOKEN;
-if (!BOT_TOKEN) {
-  console.warn('⚠️  BOT_TOKEN is not set — GET /check-subscription will always fail closed (subscribed: false).');
-}
-
-// ============================================
-// SUBSCRIPTION CHECK CACHE
-// ============================================
-// GET /check-subscription hits Telegram's getChatMember for every
-// call. That's fine for a one-off click, but the frontend also calls
-// it right before every spin attempt, so a short in-memory cache keeps
-// a user mashing "Check Again" (or re-opening Void Spin repeatedly)
-// from hammering the Bot API and tripping its rate limit. Positive AND
-// negative results are cached — negative ones expire faster so someone
-// who just joined isn't stuck waiting out the full TTL.
-// ============================================
-
-const subCache = new Map(); // `${userId}:${channel}` -> { subscribed, expiresAt }
-const SUB_CACHE_TTL_SUBSCRIBED_MS = 60_000;
-const SUB_CACHE_TTL_UNSUBSCRIBED_MS = 15_000;
-
-function getCachedSub(key) {
-  const hit = subCache.get(key);
-  if (!hit) return undefined;
-  if (Date.now() > hit.expiresAt) { subCache.delete(key); return undefined; }
-  return hit.subscribed;
-}
-
-function setCachedSub(key, subscribed) {
-  const ttl = subscribed ? SUB_CACHE_TTL_SUBSCRIBED_MS : SUB_CACHE_TTL_UNSUBSCRIBED_MS;
-  subCache.set(key, { subscribed, expiresAt: Date.now() + ttl });
-}
-
 // ============================================
 // AUTO-CREATE TABLE ON STARTUP
 // ============================================
@@ -189,71 +153,6 @@ app.get('/', async (req, res) => {
     });
   } catch (err) {
     res.status(503).json({ status: 'error', message: err.message });
-  }
-});
-
-// ============================================
-// GET /check-subscription/:userId
-// ============================================
-// Called by: webapp, before every Void Spin (Subscription.guard() in
-// script.js). Query: ?channel=@YourChannel
-//
-// FIX: this route didn't exist — only the cache scaffold above it did
-// (subCache/getCachedSub/setCachedSub). The frontend was calling this
-// exact path on GIFT_RELAYER_URL and getting no live route to hit,
-// which — combined with the frontend's old fail-OPEN catch handler —
-// is why Void Spin worked with no subscription check at all. Both
-// halves are fixed now: this route exists and answers honestly, and
-// the frontend fails closed if it ever can't reach it.
-// ============================================
-
-app.get('/check-subscription/:userId', async (req, res) => {
-  const { userId } = req.params;
-  const { channel } = req.query;
-
-  if (!userId || isNaN(Number(userId))) {
-    return res.status(400).json({ error: 'Valid numeric userId is required' });
-  }
-  if (!channel) {
-    return res.status(400).json({ error: 'channel query param is required' });
-  }
-  if (!BOT_TOKEN) {
-    return res.status(500).json({ error: 'Server misconfigured: BOT_TOKEN missing', subscribed: false });
-  }
-
-  const cacheKey = `${userId}:${channel}`;
-  const cached = getCachedSub(cacheKey);
-  if (cached !== undefined) {
-    return res.json({ subscribed: cached, cached: true });
-  }
-
-  try {
-    const tgRes = await fetch(
-      `https://api.telegram.org/bot${BOT_TOKEN}/getChatMember?chat_id=${encodeURIComponent(channel)}&user_id=${userId}`
-    );
-    const tgData = await tgRes.json();
-
-    if (!tgData.ok) {
-      // e.g. user never started a chat with the bot / bot isn't admin in
-      // the channel / bad channel handle. Treat as "not subscribed"
-      // rather than 500ing the whole request — the modal is the correct
-      // UX for all of these, not a broken app.
-      console.warn('⚠️  getChatMember not ok:', tgData.description);
-      setCachedSub(cacheKey, false);
-      return res.json({ subscribed: false });
-    }
-
-    const status = tgData.result.status; // creator | administrator | member | restricted | left | kicked
-    const subscribed = !['left', 'kicked'].includes(status);
-
-    setCachedSub(cacheKey, subscribed);
-    res.json({ subscribed });
-
-  } catch (err) {
-    console.error('❌ GET /check-subscription error:', err.message);
-    // Fail closed here too — an errored check is a failed check, not a
-    // free pass.
-    res.status(502).json({ error: 'Subscription check failed', subscribed: false });
   }
 });
 
@@ -872,7 +771,6 @@ async function start() {
     console.log('✅ CORS enabled for all origins');
     console.log('');
     console.log('📡 Endpoints:');
-    console.log('   GET    /check-subscription/:id → Telegram channel membership check');
     console.log('   POST   /prizes               → store a new prize');
     console.log('   GET    /prizes?user_id=      → get user prizes');
     console.log('   GET    /prizes/:id           → get one prize');
