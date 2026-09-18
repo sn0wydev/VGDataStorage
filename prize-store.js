@@ -47,6 +47,41 @@ pool.on('error', (err) => {
 });
 
 // ============================================
+// ADMIN AUTH — ADMIN: new
+// ============================================
+// bot.js sends this as the `x-admin-key` header on every /admin/* request.
+// Must match the ADMIN_API_KEY env var set on the bot service. Without a
+// match, all /admin/* routes reject with 401 — this is the only thing
+// gating them, since the rest of the API is intentionally open.
+// ============================================
+const ADMIN_API_KEY = process.env.ADMIN_API_KEY;
+
+function requireAdminKey(req, res, next) {
+  if (!ADMIN_API_KEY) {
+    return res.status(503).json({ error: 'Admin routes not configured (ADMIN_API_KEY not set)' });
+  }
+  if (req.get('x-admin-key') !== ADMIN_API_KEY) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  next();
+}
+
+// Best-effort audit log for admin writes. Never blocks the actual action
+// on a logging failure — a failed INSERT here shouldn't stop stars/gifts
+// from being granted, it just means that one action goes unlogged.
+async function logAdminAction(adminId, action, targetUserId, payload) {
+  try {
+    await pool.query(
+      `INSERT INTO admin_actions (admin_id, action, target_user_id, payload)
+       VALUES ($1, $2, $3, $4)`,
+      [adminId, action, targetUserId, payload ? JSON.stringify(payload) : null]
+    );
+  } catch (err) {
+    console.error('⚠️  Failed to log admin action:', err.message);
+  }
+}
+
+// ============================================
 // AUTO-CREATE TABLE ON STARTUP
 // ============================================
 
@@ -126,15 +161,35 @@ async function initDatabase() {
     CREATE INDEX IF NOT EXISTS idx_users_stars ON users (stars DESC);
   `;
 
+  // ── Admin audit log — ADMIN: new ──
+  // Every write made through /admin/* (addstars, removestars, addgift,
+  // addnft) gets a row here: who did it, to whom, and what was sent.
+  const createAdminActionsTable = `
+    CREATE TABLE IF NOT EXISTS admin_actions (
+      id              SERIAL      PRIMARY KEY,
+      admin_id        BIGINT      NOT NULL,
+      action          TEXT        NOT NULL,
+      target_user_id  BIGINT      NOT NULL,
+      payload         JSONB,
+      created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `;
+
+  const createIndexAdminActions = `
+    CREATE INDEX IF NOT EXISTS idx_admin_actions_target ON admin_actions (target_user_id);
+  `;
+
   // FIX: order changed — both tables exist before addColumns touches either.
   await pool.query(createTable);
   await pool.query(createUsersTable);
+  await pool.query(createAdminActionsTable);
   await pool.query(addColumns);
   await pool.query(createIndexUser);
   await pool.query(createIndexStatus);
   await pool.query(createIndexScheduled);
   await pool.query(createIndexCoins);
   await pool.query(createIndexStars);
+  await pool.query(createIndexAdminActions);
 
   console.log('✅ Database tables ready');
 }
@@ -641,6 +696,171 @@ app.put('/users/:user_id', async (req, res) => {
 });
 
 // ============================================
+// ADMIN ROUTES — ADMIN: new
+// ============================================
+// Everything under /admin requires the x-admin-key header (see
+// requireAdminKey above). This is what bot.js's /addstars, /removeStars,
+// /addgift, /addnft, /getstats and /getBalance commands actually call —
+// they were referenced from bot.js but never existed here, which is why
+// none of those admin commands worked end-to-end before.
+// ============================================
+app.use('/admin', requireAdminKey);
+
+// GET /admin/users/:user_id/stats
+// Full picture: balances + the user's prize history (used by /getstats).
+app.get('/admin/users/:user_id/stats', async (req, res) => {
+  const { user_id } = req.params;
+  if (!user_id || isNaN(Number(user_id))) {
+    return res.status(400).json({ error: 'Valid numeric user_id is required' });
+  }
+
+  try {
+    const [userRes, prizesRes] = await Promise.all([
+      pool.query('SELECT coins, stars FROM users WHERE user_id = $1', [user_id]),
+      pool.query('SELECT prize_id, gift_name, status, updated_at FROM prizes WHERE user_id = $1 ORDER BY created_at DESC', [user_id])
+    ]);
+
+    const counts = {};
+    for (const p of prizesRes.rows) {
+      counts[p.gift_name] = (counts[p.gift_name] || 0) + 1;
+    }
+
+    res.json({
+      user: userRes.rows[0] || { coins: 0, stars: 0 },
+      prizes: prizesRes.rows,
+      counts
+    });
+  } catch (err) {
+    console.error('❌ GET /admin/users/:id/stats error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /admin/users/:user_id/balance
+// Lighter-weight than /stats — just coins/stars, for /getBalance.
+app.get('/admin/users/:user_id/balance', async (req, res) => {
+  const { user_id } = req.params;
+  if (!user_id || isNaN(Number(user_id))) {
+    return res.status(400).json({ error: 'Valid numeric user_id is required' });
+  }
+
+  try {
+    const result = await pool.query('SELECT user_id, coins, stars FROM users WHERE user_id = $1', [user_id]);
+    const row = result.rows[0] || { user_id: Number(user_id), coins: 0, stars: 0 };
+    res.json({ user: row });
+  } catch (err) {
+    console.error('❌ GET /admin/users/:id/balance error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /admin/users/:user_id/stars
+// Body: { amount, admin_id }  — amount may be negative to deduct.
+// Used by /addstars. Clamped so a balance can never go below 0.
+app.post('/admin/users/:user_id/stars', async (req, res) => {
+  const { user_id } = req.params;
+  const { amount, admin_id } = req.body;
+
+  if (!user_id || isNaN(Number(user_id))) {
+    return res.status(400).json({ error: 'Valid numeric user_id is required' });
+  }
+  const amt = parseInt(amount, 10);
+  if (!Number.isFinite(amt) || amt === 0) {
+    return res.status(400).json({ error: 'amount must be a non-zero integer' });
+  }
+
+  try {
+    const result = await pool.query(
+      `INSERT INTO users (user_id, stars) VALUES ($1, GREATEST($2, 0))
+       ON CONFLICT (user_id) DO UPDATE SET
+         stars = GREATEST(users.stars + $2, 0),
+         updated_at = NOW()
+       RETURNING stars`,
+      [user_id, amt]
+    );
+
+    await logAdminAction(admin_id, 'addstars', user_id, { amount: amt });
+
+    res.json({ success: true, stars: result.rows[0].stars });
+  } catch (err) {
+    console.error('❌ POST /admin/users/:id/stars error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// DELETE /admin/users/:user_id/stars
+// Body: { admin_id } — used by /removeStars. Zeroes the user's star
+// balance in the mini app entirely (not a partial deduction).
+app.delete('/admin/users/:user_id/stars', async (req, res) => {
+  const { user_id } = req.params;
+  const { admin_id } = req.body;
+
+  if (!user_id || isNaN(Number(user_id))) {
+    return res.status(400).json({ error: 'Valid numeric user_id is required' });
+  }
+
+  try {
+    // Capture the pre-reset value in the same statement (via a CTE) rather
+    // than a separate SELECT before/after — avoids a race where a concurrent
+    // balance change between two queries reports the wrong "previous" value.
+    const result = await pool.query(
+      `WITH before AS (
+         INSERT INTO users (user_id, stars) VALUES ($1, 0)
+         ON CONFLICT (user_id) DO UPDATE SET stars = users.stars
+         RETURNING stars AS previous_stars
+       )
+       UPDATE users SET stars = 0, updated_at = NOW()
+       WHERE user_id = $1
+       RETURNING stars, (SELECT previous_stars FROM before)`,
+      [user_id]
+    );
+
+    await logAdminAction(admin_id, 'removestars', user_id, {});
+
+    res.json({
+      success: true,
+      stars: result.rows[0].stars,
+      previous_stars: result.rows[0].previous_stars
+    });
+  } catch (err) {
+    console.error('❌ DELETE /admin/users/:id/stars error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /admin/gifts
+// Body: { user_id, gift_name, nft_slug (optional), admin_id }
+// Used by both /addgift and /addnft (nft_slug present => addnft).
+// Inserted as status='pending' — same starting state as a normally-won
+// prize — so it goes through the existing lock/claim flow in the
+// gift-relayer rather than needing a separate admin-only delivery path.
+app.post('/admin/gifts', async (req, res) => {
+  const { user_id, gift_name, nft_slug, admin_id } = req.body;
+
+  if (!user_id || isNaN(Number(user_id)) || !gift_name) {
+    return res.status(400).json({ error: 'user_id and gift_name are required' });
+  }
+
+  const prize_id = `admin_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+
+  try {
+    const result = await pool.query(
+      `INSERT INTO prizes (prize_id, gift_name, user_id, status, nft_slug)
+       VALUES ($1, $2, $3, 'pending', $4)
+       RETURNING *`,
+      [prize_id, gift_name, user_id, nft_slug || null]
+    );
+
+    await logAdminAction(admin_id, nft_slug ? 'addnft' : 'addgift', user_id, { gift_name, nft_slug: nft_slug || undefined });
+
+    res.status(201).json({ success: true, prize: result.rows[0] });
+  } catch (err) {
+    console.error('❌ POST /admin/gifts error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================
 // GET /leaderboard
 // ============================================
 // Called by: webapp Leaderboard page.
@@ -783,6 +1003,12 @@ async function start() {
     console.log('   DELETE /prizes/:id           → remove claimed prize');
     console.log('   PUT    /users/:id            → upsert profile/balances');
     console.log('   GET    /leaderboard          → top coins/stars/gifts + your rank');
+    console.log('   -- admin (x-admin-key required) --');
+    console.log('   GET    /admin/users/:id/stats    → balances + prize history');
+    console.log('   GET    /admin/users/:id/balance  → coins/stars only');
+    console.log('   POST   /admin/users/:id/stars    → add/remove N stars');
+    console.log('   DELETE /admin/users/:id/stars    → zero out star balance');
+    console.log('   POST   /admin/gifts              → grant a gift/NFT');
     console.log('═══════════════════════════════════════════');
   });
 }
