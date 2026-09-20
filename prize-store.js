@@ -945,11 +945,15 @@ app.get('/leaderboard', async (req, res) => {
 
       const own = ownRes.rows[0] || { coins: 0, stars: 0, show_in_leaderboard: true };
 
+      // The webapp reads `hidden` per tab (you[tab].hidden) to show "—" instead
+      // of a rank for players who opted out, so it is set on each entry as well
+      // as at the top level (kept for anything already reading it there).
+      const hidden = own.show_in_leaderboard === false;
       you = {
-        coins: { rank: coinsRank.rows[0].rank, score: Number(own.coins) || 0 },
-        stars: { rank: starsRank.rows[0].rank, score: Number(own.stars) || 0 },
-        gifts: { rank: giftsRank.rows[0].rank, score: giftsCountRes.rows[0].gifts },
-        hidden: own.show_in_leaderboard === false
+        coins: { rank: coinsRank.rows[0].rank, score: Number(own.coins) || 0, hidden },
+        stars: { rank: starsRank.rows[0].rank, score: Number(own.stars) || 0, hidden },
+        gifts: { rank: giftsRank.rows[0].rank, score: giftsCountRes.rows[0].gifts, hidden },
+        hidden
       };
     }
 
