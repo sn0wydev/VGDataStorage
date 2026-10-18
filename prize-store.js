@@ -34,6 +34,14 @@ const app = express();
 app.use(cors()); // ← ENABLE CORS FOR ALL ROUTES
 app.use(express.json());
 
+// ── SECURITY (game-server update) ──────────────────────────────────────────
+// Balances, prize creation and prize status are now owned by the game server
+// (VGGameServer). Every route that can WRITE them — and the ones that list a
+// player's inventory/balance — requires the shared x-internal-key, so nothing
+// can be changed or farmed straight from a browser. Only the game server and
+// the relayer know INTERNAL_API_KEY. Public reads left: health, leaderboard,
+// /users/:id/subscription, nft-credits, nft-sales.
+
 // ============================================
 // DATABASE CONNECTION
 // ============================================
@@ -61,6 +69,28 @@ function requireAdminKey(req, res, next) {
     return res.status(503).json({ error: 'Admin routes not configured (ADMIN_API_KEY not set)' });
   }
   if (req.get('x-admin-key') !== ADMIN_API_KEY) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  next();
+}
+
+// ============================================
+// INTERNAL AUTH — service-to-service (main bot + gift relayer)
+// ============================================
+// Separate from ADMIN_API_KEY on purpose: the main bot only needs to
+// "record a Stars top-up" and the relayer only needs to "use one up for an
+// NFT claim". Neither should be able to add stars/gifts like an admin can.
+// Both send it as the `x-internal-key` header; set the same INTERNAL_API_KEY
+// value on prize-store, the main bot (VGServers) and the relayer.
+// ============================================
+const INTERNAL_API_KEY = process.env.INTERNAL_API_KEY;
+const NFT_TOPUP_MIN_STARS = parseInt(process.env.NFT_TOPUP_MIN_STARS, 10) || 25;
+
+function requireInternalKey(req, res, next) {
+  if (!INTERNAL_API_KEY) {
+    return res.status(503).json({ error: 'Internal routes not configured (INTERNAL_API_KEY not set)' });
+  }
+  if (req.get('x-internal-key') !== INTERNAL_API_KEY) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
   next();
@@ -119,6 +149,7 @@ async function initDatabase() {
       avatar_url             TEXT,
       coins                 BIGINT      NOT NULL DEFAULT 0,
       stars                  BIGINT      NOT NULL DEFAULT 0,
+      stars_spent            BIGINT      NOT NULL DEFAULT 0,
       show_in_leaderboard    BOOLEAN     NOT NULL DEFAULT true,
       last_claim_at          TIMESTAMPTZ,
       updated_at             TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -139,6 +170,8 @@ async function initDatabase() {
     ALTER TABLE prizes ADD COLUMN IF NOT EXISTS scheduled_for TIMESTAMPTZ;
     ALTER TABLE prizes ADD COLUMN IF NOT EXISTS nft_slug      TEXT;
     ALTER TABLE users  ADD COLUMN IF NOT EXISTS last_claim_at TIMESTAMPTZ;
+    ALTER TABLE users  ADD COLUMN IF NOT EXISTS subscription_override BOOLEAN;
+    ALTER TABLE users  ADD COLUMN IF NOT EXISTS stars_spent BIGINT NOT NULL DEFAULT 0;
   `;
 
   const createIndexScheduled = `
@@ -179,9 +212,46 @@ async function initDatabase() {
     CREATE INDEX IF NOT EXISTS idx_admin_actions_target ON admin_actions (target_user_id);
   `;
 
+  // ── NFT top-up credits ──
+  // One row per real Telegram Stars payment (recorded by the main bot).
+  // A payment of at least NFT_TOPUP_MIN_STARS (25) is worth ONE NFT claim:
+  // claiming an NFT "uses up" one unused qualifying row (consumed_by = the
+  // prize it paid for). So every NFT needs its own fresh top-up.
+  const createTopupsTable = `
+    CREATE TABLE IF NOT EXISTS star_topups (
+      payment_id   TEXT        PRIMARY KEY,
+      user_id      BIGINT      NOT NULL,
+      stars        INTEGER     NOT NULL,
+      consumed_by  TEXT,
+      consumed_at  TIMESTAMPTZ,
+      created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `;
+  // ── NFT buyback sales ──
+  // One row per collectible a player sent to the relayer. sale_key makes the
+  // credit idempotent (relayer retries / restarts can never pay twice).
+  const createSalesTable = `
+    CREATE TABLE IF NOT EXISTS nft_sales (
+      sale_key    TEXT        PRIMARY KEY,
+      user_id     BIGINT      NOT NULL,
+      title       TEXT        NOT NULL,
+      slug        TEXT,
+      num         BIGINT,
+      stars       INTEGER     NOT NULL,
+      created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_nft_sales_user ON nft_sales (user_id, created_at DESC);
+  `;
+  const createIndexTopups = `
+    CREATE INDEX IF NOT EXISTS idx_star_topups_user ON star_topups (user_id, consumed_by);
+  `;
+
   // FIX: order changed — both tables exist before addColumns touches either.
   await pool.query(createTable);
   await pool.query(createUsersTable);
+  await pool.query(createSalesTable);
+  await pool.query(createTopupsTable);
+  await pool.query(createIndexTopups);
   await pool.query(createAdminActionsTable);
   await pool.query(addColumns);
   await pool.query(createIndexUser);
@@ -218,7 +288,7 @@ app.get('/', async (req, res) => {
 // Body: { prize_id, gift_name, user_id, username }
 // ============================================
 
-app.post('/prizes', async (req, res) => {
+app.post('/prizes', requireInternalKey, async (req, res) => {
   const { prize_id, gift_name, user_id, username } = req.body;
 
   console.log('\n📝 Prize registration request:');
@@ -273,7 +343,7 @@ app.post('/prizes', async (req, res) => {
 //           exists before sending the gift.
 // ============================================
 
-app.get('/prizes/:prize_id', async (req, res) => {
+app.get('/prizes/:prize_id', requireInternalKey, async (req, res) => {
   try {
     const result = await pool.query(
       'SELECT * FROM prizes WHERE prize_id = $1',
@@ -300,7 +370,7 @@ app.get('/prizes/:prize_id', async (req, res) => {
 // Called by: webapp, to load a user's inventory.
 // ============================================
 
-app.get('/prizes', async (req, res) => {
+app.get('/prizes', requireInternalKey, async (req, res) => {
   const { user_id, status } = req.query;
 
   if (!user_id) {
@@ -335,7 +405,7 @@ app.get('/prizes', async (req, res) => {
 // Body: { status, error_message (optional) }
 // ============================================
 
-app.patch('/prizes/:prize_id', async (req, res) => {
+app.patch('/prizes/:prize_id', requireInternalKey, async (req, res) => {
   const { status, error_message } = req.body;
   const { prize_id } = req.params;
 
@@ -385,7 +455,7 @@ app.patch('/prizes/:prize_id', async (req, res) => {
 // Body: { user_id }  — must match the prize's owner.
 // ============================================
 
-app.post('/prizes/:prize_id/lock', async (req, res) => {
+app.post('/prizes/:prize_id/lock', requireInternalKey, async (req, res) => {
   const { prize_id } = req.params;
   const { user_id } = req.body;
 
@@ -440,7 +510,7 @@ app.post('/prizes/:prize_id/lock', async (req, res) => {
 // Body: { claim_type: 'nft', scheduled_for (ISO string), nft_slug? }
 // ============================================
 
-app.post('/prizes/:prize_id/schedule', async (req, res) => {
+app.post('/prizes/:prize_id/schedule', requireInternalKey, async (req, res) => {
   const { prize_id } = req.params;
   const { claim_type, scheduled_for, nft_slug } = req.body;
 
@@ -477,7 +547,7 @@ app.post('/prizes/:prize_id/schedule', async (req, res) => {
 // transfers whose 48h window has elapsed.
 // ============================================
 
-app.get('/prizes/queue/nft-due', async (req, res) => {
+app.get('/prizes/queue/nft-due', requireInternalKey, async (req, res) => {
   const limit = Math.min(parseInt(req.query.limit, 10) || 20, 100);
 
   try {
@@ -512,7 +582,7 @@ app.get('/prizes/queue/nft-due', async (req, res) => {
 // Body: { expected_last_claim_at }
 // ============================================
 
-app.delete('/users/:user_id/cooldown', async (req, res) => {
+app.delete('/users/:user_id/cooldown', requireInternalKey, async (req, res) => {
   const { user_id } = req.params;
   const { expected_last_claim_at } = req.body;
 
@@ -554,7 +624,7 @@ app.delete('/users/:user_id/cooldown', async (req, res) => {
 // cooldown as started), or 429 { ok: false, retry_after } if not.
 // ============================================
 
-app.post('/users/:user_id/cooldown', async (req, res) => {
+app.post('/users/:user_id/cooldown', requireInternalKey, async (req, res) => {
   const { user_id } = req.params;
 
   // FIX: `parseInt(req.body.cooldown_seconds, 10) || 10` treated an
@@ -620,7 +690,7 @@ app.post('/users/:user_id/cooldown', async (req, res) => {
 //           prize status is "claimed".
 // ============================================
 
-app.delete('/prizes/:prize_id', async (req, res) => {
+app.delete('/prizes/:prize_id', requireInternalKey, async (req, res) => {
   try {
     const result = await pool.query(
       'DELETE FROM prizes WHERE prize_id = $1 AND status = $2 RETURNING *',
@@ -648,14 +718,17 @@ app.delete('/prizes/:prize_id', async (req, res) => {
 // Called by: webapp, on login and on every coin/star
 //            change, so the leaderboard has a live copy.
 // Body: { username, first_name, last_name, avatar_url,
-//         coins, stars, show_in_leaderboard }
+//         coins, stars, stars_spent, show_in_leaderboard }
+// stars_spent = lifetime Stars spent on spins. It can only go UP (GREATEST),
+// so a stale client can never lower it.
 // Any field can be omitted — omitted fields are left
 // untouched on an existing row (partial update).
 // ============================================
 
-app.put('/users/:user_id', async (req, res) => {
+app.put('/users/:user_id', requireInternalKey, async (req, res) => {
   const { user_id } = req.params;
-  const { username, first_name, last_name, avatar_url, coins, stars, show_in_leaderboard } = req.body;
+  const { username, first_name, last_name, avatar_url, coins, stars, stars_spent, show_in_leaderboard } = req.body;
+  const spent = Number.isFinite(Number(stars_spent)) && Number(stars_spent) >= 0 ? Math.trunc(Number(stars_spent)) : null;
 
   if (!user_id || isNaN(Number(user_id))) {
     return res.status(400).json({ error: 'Valid numeric user_id is required' });
@@ -663,8 +736,8 @@ app.put('/users/:user_id', async (req, res) => {
 
   try {
     const result = await pool.query(
-      `INSERT INTO users (user_id, username, first_name, last_name, avatar_url, coins, stars, show_in_leaderboard, updated_at)
-       VALUES ($1, $2, $3, $4, $5, COALESCE($6, 0), COALESCE($7, 0), COALESCE($8, true), NOW())
+      `INSERT INTO users (user_id, username, first_name, last_name, avatar_url, coins, stars, show_in_leaderboard, stars_spent, updated_at)
+       VALUES ($1, $2, $3, $4, $5, COALESCE($6, 0), COALESCE($7, 0), COALESCE($8, true), COALESCE($9, 0), NOW())
        ON CONFLICT (user_id) DO UPDATE SET
          username             = COALESCE($2, users.username),
          first_name           = COALESCE($3, users.first_name),
@@ -673,6 +746,7 @@ app.put('/users/:user_id', async (req, res) => {
          coins                 = COALESCE($6, users.coins),
          stars                 = COALESCE($7, users.stars),
          show_in_leaderboard   = COALESCE($8, users.show_in_leaderboard),
+         stars_spent           = GREATEST(users.stars_spent, COALESCE($9, 0)),
          updated_at            = NOW()
        RETURNING *`,
       [
@@ -683,7 +757,8 @@ app.put('/users/:user_id', async (req, res) => {
         avatar_url ?? null,
         coins !== undefined ? coins : null,
         stars !== undefined ? stars : null,
-        show_in_leaderboard !== undefined ? show_in_leaderboard : null
+        show_in_leaderboard !== undefined ? show_in_leaderboard : null,
+        spent
       ]
     );
 
@@ -691,6 +766,214 @@ app.put('/users/:user_id', async (req, res) => {
 
   } catch (err) {
     console.error('❌ PUT /users/:id error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================
+// GET /users/:user_id/subscription
+// ============================================
+// GET /users/:user_id
+// ============================================
+// Called by: webapp on every launch (BackendAPI.fetchServerBalance) to pull in
+// changes made OUTSIDE the app: NFT buyback credits from the relayer and
+// support-bot /addstars. 404 = no row yet (the app treats that as "nothing to pull").
+// ============================================
+app.get('/users/:user_id', requireInternalKey, async (req, res) => {
+  const { user_id } = req.params;
+  if (!user_id || isNaN(Number(user_id))) return res.status(400).json({ error: 'Valid numeric user_id is required' });
+  try {
+    const r = await pool.query('SELECT user_id, coins, stars, stars_spent FROM users WHERE user_id = $1', [user_id]);
+    if (!r.rows[0]) return res.status(404).json({ error: 'User not found' });
+    res.set('Cache-Control', 'no-store').json({ user: r.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================
+// Called by: the main bot's /check-subscription, before it asks Telegram.
+// Returns { subscription_override: true | null }. true means a manager
+// manually marked this user as subscribed (/setsub in the support bot), so
+// the channel check is skipped for them. Read-only and carries nothing
+// sensitive, so — like the rest of the read API — it isn't key-gated.
+// ============================================
+app.get('/users/:user_id/subscription', async (req, res) => {
+  const { user_id } = req.params;
+  if (!user_id || isNaN(Number(user_id))) {
+    return res.status(400).json({ error: 'Valid numeric user_id is required' });
+  }
+  try {
+    const result = await pool.query('SELECT subscription_override FROM users WHERE user_id = $1', [user_id]);
+    res.json({ user_id: Number(user_id), subscription_override: result.rows[0]?.subscription_override ?? null });
+  } catch (err) {
+    console.error('❌ GET /users/:id/subscription error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================
+// GET /users/:user_id/nft-credits
+// ============================================
+// Called by: the Mini App (to show "you have N NFT unlocks") — read-only.
+// available = qualifying top-ups not yet used for an NFT claim.
+// ============================================
+app.get('/users/:user_id/nft-credits', async (req, res) => {
+  const { user_id } = req.params;
+  if (!user_id || isNaN(Number(user_id))) {
+    return res.status(400).json({ error: 'Valid numeric user_id is required' });
+  }
+  try {
+    const r = await pool.query(
+      `SELECT COUNT(*)::int AS available FROM star_topups
+       WHERE user_id = $1 AND consumed_by IS NULL AND stars >= $2`,
+      [user_id, NFT_TOPUP_MIN_STARS]
+    );
+    res.json({ user_id: Number(user_id), available: r.rows[0].available, required_stars: NFT_TOPUP_MIN_STARS });
+  } catch (err) {
+    console.error('❌ GET /users/:id/nft-credits error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================
+// INTERNAL ROUTES (x-internal-key) — main bot + relayer
+// ============================================
+
+// POST /internal/topups   — called by the main bot after a Stars payment.
+// Body: { user_id, stars, payment_id }. Idempotent on payment_id (Telegram
+// can redeliver a payment update), so recording twice is harmless.
+app.post('/internal/topups', requireInternalKey, async (req, res) => {
+  const { user_id, stars, payment_id } = req.body || {};
+  const amount = parseInt(stars, 10);
+  if (!user_id || isNaN(Number(user_id)) || !payment_id || !Number.isFinite(amount) || amount <= 0) {
+    return res.status(400).json({ error: 'user_id, payment_id and a positive stars amount are required' });
+  }
+  try {
+    const r = await pool.query(
+      `INSERT INTO star_topups (payment_id, user_id, stars) VALUES ($1, $2, $3)
+       ON CONFLICT (payment_id) DO NOTHING RETURNING payment_id`,
+      [String(payment_id), user_id, amount]
+    );
+    res.json({ success: true, recorded: r.rows.length === 1, qualifies: amount >= NFT_TOPUP_MIN_STARS });
+  } catch (err) {
+    console.error('❌ POST /internal/topups error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /internal/nft-credits/consume   — called by the relayer when an NFT
+// claim is about to be accepted. Body: { user_id, prize_id }.
+//   200 { credit_id }              one qualifying top-up is now tied to this prize
+//   402 { code: 'TOPUP_REQUIRED' } the user has no unused qualifying top-up
+// Idempotent per prize: retrying a claim that already holds a credit
+// returns that same credit instead of eating a second one.
+app.post('/internal/nft-credits/consume', requireInternalKey, async (req, res) => {
+  const { user_id, prize_id } = req.body || {};
+  if (!user_id || isNaN(Number(user_id)) || !prize_id) {
+    return res.status(400).json({ error: 'user_id and prize_id are required' });
+  }
+  try {
+    const already = await pool.query(
+      'SELECT payment_id FROM star_topups WHERE consumed_by = $1 AND user_id = $2 LIMIT 1',
+      [prize_id, user_id]
+    );
+    if (already.rows.length) return res.json({ success: true, credit_id: already.rows[0].payment_id, reused: true });
+
+    // One atomic statement: pick the oldest unused qualifying top-up and
+    // claim it. SKIP LOCKED means two simultaneous claims can never grab
+    // the same row.
+    const r = await pool.query(
+      `UPDATE star_topups SET consumed_by = $1, consumed_at = NOW()
+       WHERE payment_id = (
+         SELECT payment_id FROM star_topups
+         WHERE user_id = $2 AND consumed_by IS NULL AND stars >= $3
+         ORDER BY created_at ASC
+         LIMIT 1
+         FOR UPDATE SKIP LOCKED
+       )
+       RETURNING payment_id`,
+      [prize_id, user_id, NFT_TOPUP_MIN_STARS]
+    );
+    if (r.rows.length === 0) {
+      return res.status(402).json({
+        error: `Top up at least ${NFT_TOPUP_MIN_STARS} Stars to claim an NFT gift`,
+        code: 'TOPUP_REQUIRED',
+        required_stars: NFT_TOPUP_MIN_STARS
+      });
+    }
+    res.json({ success: true, credit_id: r.rows[0].payment_id });
+  } catch (err) {
+    console.error('❌ POST /internal/nft-credits/consume error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /internal/nft-credits/release   — hands the credit back when a claim
+// failed before anything was delivered. Body: { prize_id }.
+// POST /internal/nft-sales   (relayer -> here, x-internal-key)
+// Body: { sale_key, user_id, title, slug, num, stars }
+// Records the sale and adds `stars` to the seller's balance in ONE transaction.
+// Repeating the same sale_key is a no-op ({ credited: false }).
+app.post('/internal/nft-sales', requireInternalKey, async (req, res) => {
+  const { sale_key, user_id, title, slug, num, stars } = req.body || {};
+  const amt = Math.trunc(Number(stars));
+  if (!sale_key || !title || isNaN(Number(user_id)) || !Number.isFinite(amt) || amt <= 0 || amt > 1000000) {
+    return res.status(400).json({ error: 'sale_key, title, numeric user_id and stars (1..1000000) are required' });
+  }
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const ins = await client.query(
+      `INSERT INTO nft_sales (sale_key, user_id, title, slug, num, stars)
+       VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (sale_key) DO NOTHING RETURNING sale_key`,
+      [String(sale_key), user_id, String(title), slug ?? null, Number.isFinite(Number(num)) ? Number(num) : null, amt]
+    );
+    let balance = null;
+    if (ins.rowCount) {
+      const u = await client.query(
+        `INSERT INTO users (user_id, stars) VALUES ($1, $2)
+         ON CONFLICT (user_id) DO UPDATE SET stars = users.stars + $2, updated_at = NOW()
+         RETURNING stars`,
+        [user_id, amt]
+      );
+      balance = u.rows[0].stars;
+    }
+    await client.query('COMMIT');
+    res.json({ success: true, credited: ins.rowCount === 1, stars: amt, balance });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('❌ POST /internal/nft-sales error:', err.message);
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+// GET /users/:user_id/nft-sales — a player's recent buyback history (for the app).
+app.get('/users/:user_id/nft-sales', async (req, res) => {
+  if (isNaN(Number(req.params.user_id))) return res.status(400).json({ error: 'Valid numeric user_id is required' });
+  try {
+    const r = await pool.query(
+      'SELECT title, slug, num, stars, created_at FROM nft_sales WHERE user_id = $1 ORDER BY created_at DESC LIMIT 30',
+      [req.params.user_id]
+    );
+    res.json({ sales: r.rows });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/internal/nft-credits/release', requireInternalKey, async (req, res) => {
+  const { prize_id } = req.body || {};
+  if (!prize_id) return res.status(400).json({ error: 'prize_id is required' });
+  try {
+    const r = await pool.query(
+      `UPDATE star_topups SET consumed_by = NULL, consumed_at = NULL
+       WHERE consumed_by = $1 RETURNING payment_id`,
+      [prize_id]
+    );
+    res.json({ success: true, released: r.rows.length });
+  } catch (err) {
+    console.error('❌ POST /internal/nft-credits/release error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -716,7 +999,7 @@ app.get('/admin/users/:user_id/stats', async (req, res) => {
 
   try {
     const [userRes, prizesRes] = await Promise.all([
-      pool.query('SELECT coins, stars FROM users WHERE user_id = $1', [user_id]),
+      pool.query('SELECT coins, stars, subscription_override FROM users WHERE user_id = $1', [user_id]),
       pool.query('SELECT prize_id, gift_name, status, updated_at FROM prizes WHERE user_id = $1 ORDER BY created_at DESC', [user_id])
     ]);
 
@@ -828,6 +1111,72 @@ app.delete('/admin/users/:user_id/stars', async (req, res) => {
   }
 });
 
+// POST /admin/users/:user_id/subscription
+// Body: { subscribed: true | false, admin_id }
+// Used by /setsub. true  = force this user to count as subscribed (the
+// channel check is bypassed). false = remove the override, so they go back
+// to being checked against the real channel membership.
+app.post('/admin/users/:user_id/subscription', async (req, res) => {
+  const { user_id } = req.params;
+  const { subscribed, admin_id } = req.body;
+
+  if (!user_id || isNaN(Number(user_id))) {
+    return res.status(400).json({ error: 'Valid numeric user_id is required' });
+  }
+  if (typeof subscribed !== 'boolean') {
+    return res.status(400).json({ error: 'subscribed must be true or false' });
+  }
+
+  const value = subscribed ? true : null; // false clears the override
+  try {
+    const result = await pool.query(
+      `INSERT INTO users (user_id, subscription_override) VALUES ($1, $2)
+       ON CONFLICT (user_id) DO UPDATE SET
+         subscription_override = $2,
+         updated_at = NOW()
+       RETURNING subscription_override`,
+      [user_id, value]
+    );
+
+    await logAdminAction(admin_id, subscribed ? 'setsub' : 'clearsub', user_id, { subscribed });
+
+    res.json({ success: true, subscription_override: result.rows[0].subscription_override });
+  } catch (err) {
+    console.error('❌ POST /admin/users/:id/subscription error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /admin/users/:user_id/nft-credits
+// Body: { count (default 1), admin_id } — used by /grantnft. Gives the user
+// free NFT-claim unlocks without a payment (support gesture / compensation).
+app.post('/admin/users/:user_id/nft-credits', async (req, res) => {
+  const { user_id } = req.params;
+  const { count, admin_id } = req.body;
+  const n = Math.min(Math.max(parseInt(count, 10) || 1, 1), 20);
+
+  if (!user_id || isNaN(Number(user_id))) {
+    return res.status(400).json({ error: 'Valid numeric user_id is required' });
+  }
+  try {
+    for (let i = 0; i < n; i++) {
+      await pool.query(
+        `INSERT INTO star_topups (payment_id, user_id, stars) VALUES ($1, $2, $3)`,
+        [`admin_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`, user_id, NFT_TOPUP_MIN_STARS]
+      );
+    }
+    await logAdminAction(admin_id, 'grantnft', user_id, { count: n });
+    const r = await pool.query(
+      `SELECT COUNT(*)::int AS available FROM star_topups WHERE user_id = $1 AND consumed_by IS NULL AND stars >= $2`,
+      [user_id, NFT_TOPUP_MIN_STARS]
+    );
+    res.json({ success: true, granted: n, available: r.rows[0].available });
+  } catch (err) {
+    console.error('❌ POST /admin/users/:id/nft-credits error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // POST /admin/gifts
 // Body: { user_id, gift_name, nft_slug (optional), admin_id }
 // Used by both /addgift and /addnft (nft_slug present => addnft).
@@ -865,6 +1214,7 @@ app.post('/admin/gifts', async (req, res) => {
 // ============================================
 // Called by: webapp Leaderboard page.
 // Query: ?user_id=123&limit=20
+// NOTE: the "stars" list is now lifetime Stars SPENT (rows carry `stars_spent`).
 // Returns top N for coins/stars/gifts in one shot
 // (so switching tabs doesn't need another request),
 // plus the caller's own rank/score in "you" if
@@ -890,10 +1240,10 @@ app.get('/leaderboard', async (req, res) => {
         [limit]
       ),
       pool.query(
-        `SELECT user_id, username, first_name, last_name, avatar_url, stars
+        `SELECT user_id, username, first_name, last_name, avatar_url, stars_spent
          FROM users
-         WHERE show_in_leaderboard = true
-         ORDER BY stars DESC, updated_at ASC
+         WHERE show_in_leaderboard = true AND stars_spent > 0
+         ORDER BY stars_spent DESC, updated_at ASC
          LIMIT $1`,
         [limit]
       ),
@@ -924,7 +1274,7 @@ app.get('/leaderboard', async (req, res) => {
         pool.query(
           `SELECT COUNT(*)::int + 1 AS rank FROM users
            WHERE show_in_leaderboard = true
-             AND stars > (SELECT COALESCE(stars, 0) FROM users WHERE user_id = $1)`,
+             AND stars_spent > (SELECT COALESCE(stars_spent, 0) FROM users WHERE user_id = $1)`,
           [userId]
         ),
         pool.query(
@@ -939,7 +1289,7 @@ app.get('/leaderboard', async (req, res) => {
            WHERE g.c > (SELECT COUNT(*) FROM prizes WHERE user_id = $1 AND status = 'claimed')`,
           [userId]
         ),
-        pool.query('SELECT coins, stars, show_in_leaderboard FROM users WHERE user_id = $1', [userId]),
+        pool.query('SELECT coins, stars, stars_spent, show_in_leaderboard FROM users WHERE user_id = $1', [userId]),
         pool.query(`SELECT COUNT(*)::int AS gifts FROM prizes WHERE user_id = $1 AND status = 'claimed'`, [userId])
       ]);
 
@@ -951,7 +1301,7 @@ app.get('/leaderboard', async (req, res) => {
       const hidden = own.show_in_leaderboard === false;
       you = {
         coins: { rank: coinsRank.rows[0].rank, score: Number(own.coins) || 0, hidden },
-        stars: { rank: starsRank.rows[0].rank, score: Number(own.stars) || 0, hidden },
+        stars: { rank: starsRank.rows[0].rank, score: Number(own.stars_spent) || 0, hidden },
         gifts: { rank: giftsRank.rows[0].rank, score: giftsCountRes.rows[0].gifts, hidden },
         hidden
       };
